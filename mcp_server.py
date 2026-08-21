@@ -658,7 +658,7 @@ def get_fitbit_health_summary(
 
 
 @mcp.tool()
-def analyze_fitbit_data_quality():
+def get_fitbit_data_quality():
     """
     Assess Fitbit data continuity and baseline reliability.
     """
