@@ -49,7 +49,8 @@ from fitbit_analysis import (
     compare_metric_periods,
     analyze_exercise_progress,
     get_health_summary,
-get_daily_health_summary
+get_daily_health_summary,
+analyze_fitbit_data_quality
 )
 
 
@@ -653,6 +654,15 @@ def get_fitbit_health_summary(
         start_date,
         end_date
     )
+
+
+
+@mcp.tool()
+def analyze_fitbit_data_quality():
+    """
+    Assess Fitbit data continuity and baseline reliability.
+    """
+    return analyze_fitbit_data_quality()
 
 
 if __name__ == "__main__":

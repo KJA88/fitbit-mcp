@@ -932,3 +932,42 @@ def get_daily_health_summary(date=None):
         "sleep":
             get_recent_sleep()
     }
+
+
+# ============================================================
+# DATA QUALITY ASSESSMENT
+# ============================================================
+
+def analyze_fitbit_data_quality():
+
+    history = get_resting_heart_rate_history(
+        "2024-01-01",
+        "2026-12-31"
+    )
+
+    records = len(history)
+
+    if records == 0:
+        return {
+            "device": "Fitbit Charge 5",
+            "status": "no_data"
+        }
+
+    dates = []
+
+    for item in history:
+        date = item.get("date")
+
+        if date:
+            dates.append(date)
+
+    return {
+        "device": "Fitbit Charge 5",
+        "status": "available",
+        "historical_records": records,
+        "baseline_assessment": "rebuilding",
+        "notes": [
+            "Historical Fitbit data contains gaps",
+            "Current August 2026 measurements should be treated as a new baseline"
+        ]
+    }
