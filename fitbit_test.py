@@ -1,5 +1,6 @@
 import os
 import requests
+import math
 
 from datetime import datetime, timedelta
 
@@ -1499,6 +1500,79 @@ def get_resting_heart_rate_history(
 # HRV
 # ============================================================
 
+def _classify_hrv_field(value):
+    """
+    Classify a single HRV-related raw field.
+      - "missing": field is None
+      - "raw_invalid_zero": numeric and equal to 0
+      - "invalid_negative": numeric, finite, and less than 0
+      - "invalid_nonnumeric": present but not convertible to float,
+        or not finite
+      - "ok": present, numeric, finite, and strictly positive
+    """
+    if value is None:
+        return "missing"
+
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return "invalid_nonnumeric"
+
+    if not math.isfinite(numeric):
+        return "invalid_nonnumeric"
+
+    if numeric == 0.0:
+        return "raw_invalid_zero"
+
+    if numeric < 0.0:
+        return "invalid_negative"
+
+    return "ok"
+
+
+def _hrv_quality(average_hrv, non_rem_hr, deep_rmssd):
+    """
+    Field-level HRV quality assessment. Adds analysis-layer metadata
+    only; every raw field in parse_hrv()'s output is unchanged.
+
+    average_hrv_ms is the primary field for the recovery-scoring
+    "recovery_average_hrv" component: it must be numeric, finite,
+    and strictly greater than zero to be usable there. Defects in
+    the secondary fields (non_rem_heart_rate_bpm, deep_sleep_rmssd_ms)
+    never block a valid positive average_hrv_ms from that use.
+    """
+
+    non_rem_status = _classify_hrv_field(non_rem_hr)
+    deep_rmssd_status = _classify_hrv_field(deep_rmssd)
+    primary_status = _classify_hrv_field(average_hrv)
+
+    field_flags = []
+    if non_rem_status != "ok":
+        field_flags.append(f"non_rem_heart_rate_bpm_{non_rem_status}")
+    if deep_rmssd_status != "ok":
+        field_flags.append(f"deep_sleep_rmssd_ms_{deep_rmssd_status}")
+
+    if primary_status != "ok":
+        return {
+            "quality_status": "invalid",
+            "quality_flags": field_flags + [f"average_hrv_ms_{primary_status}"],
+            "usable_for": []
+        }
+
+    if field_flags:
+        return {
+            "quality_status": "usable_with_caution",
+            "quality_flags": field_flags,
+            "usable_for": ["recovery_average_hrv", "display"]
+        }
+
+    return {
+        "quality_status": "valid",
+        "quality_flags": [],
+        "usable_for": ["recovery_average_hrv", "display"]
+    }
+
+
 def parse_hrv(item):
     hrv = item.get(
         "dailyHeartRateVariability",
@@ -1507,29 +1581,35 @@ def parse_hrv(item):
 
     source = item.get("dataSource", {})
 
-    return {
+    non_rem_hr = hrv.get(
+        "nonRemHeartRateBeatsPerMinute"
+    )
+
+    deep_rmssd = hrv.get(
+        "deepSleepRootMeanSquareOfSuccessiveDifferencesMilliseconds"
+    )
+
+    average_hrv = hrv.get(
+        "averageHeartRateVariabilityMilliseconds"
+    )
+
+    record = {
         "date":
             parse_date(
                 hrv.get("date")
             ),
 
         "average_hrv_ms":
-            hrv.get(
-                "averageHeartRateVariabilityMilliseconds"
-            ),
+            average_hrv,
 
         "non_rem_heart_rate_bpm":
-            hrv.get(
-                "nonRemHeartRateBeatsPerMinute"
-            ),
+            non_rem_hr,
 
         "entropy":
             hrv.get("entropy"),
 
         "deep_sleep_rmssd_ms":
-            hrv.get(
-                "deepSleepRootMeanSquareOfSuccessiveDifferencesMilliseconds"
-            ),
+            deep_rmssd,
 
         "device":
             source.get("device", {})
@@ -1538,6 +1618,12 @@ def parse_hrv(item):
         "platform":
             source.get("platform")
     }
+
+    record.update(
+        _hrv_quality(average_hrv, non_rem_hr, deep_rmssd)
+    )
+
+    return record
 
 
 def get_hrv(limit=10):
