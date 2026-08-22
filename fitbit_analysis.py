@@ -894,7 +894,9 @@ def get_health_summary(
 # DAILY HEALTH SUMMARY
 # ============================================================
 
-def get_daily_health_summary(date=None):
+def get_daily_health_summary(date_value=None):
+
+    from datetime import date
 
     from fitbit_test import (
         get_steps,
@@ -902,35 +904,47 @@ def get_daily_health_summary(date=None):
         get_total_calories,
         get_active_energy_burned,
         get_active_zone_minutes,
-        get_resting_heart_rate,
-        get_hrv,
-        get_recent_sleep
+        get_resting_heart_rate_history,
+        get_hrv_history,
+        get_sleep_history,
+        validate_date
     )
+
+    # get_resting_heart_rate/get_hrv take an int `limit`, not a date —
+    # passing a date string caused
+    # '<' not supported between instances of 'int' and 'str'.
+    # get_recent_sleep() ignored the requested date entirely and always
+    # returned the 5 most recent sleep sessions regardless of which day
+    # was asked for. Route every date-based lookup through date_text and
+    # the *_history(start, end) counterparts, which already do correct
+    # server-side single-day filtering.
+    date_text = date_value or date.today().isoformat()
+    validate_date(date_text)  # fail fast with a clear error on bad input
 
     return {
         "steps":
-            get_steps(date),
+            get_steps(date_text),
 
         "distance":
-            get_distance(date),
+            get_distance(date_text),
 
         "calories":
-            get_total_calories(date),
+            get_total_calories(date_text),
 
         "active_energy":
-            get_active_energy_burned(date),
+            get_active_energy_burned(date_text),
 
         "active_zone_minutes":
-            get_active_zone_minutes(date),
+            get_active_zone_minutes(date_text),
 
         "resting_heart_rate":
-            get_resting_heart_rate(date),
+            get_resting_heart_rate_history(date_text, date_text),
 
         "hrv":
-            get_hrv(date),
+            get_hrv_history(date_text, date_text),
 
         "sleep":
-            get_recent_sleep()
+            get_sleep_history(date_text, date_text)
     }
 
 
