@@ -1,6 +1,7 @@
 import os
 import requests
 import math
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from datetime import datetime, timedelta
 
@@ -1315,6 +1316,253 @@ def get_exercise_history(
 # SLEEP
 # ============================================================
 
+_TZ_ENV_VAR = "FITBIT_LOCAL_TIMEZONE"
+_DEFAULT_TZ_NAME = "America/Los_Angeles"
+
+AWAKE_MISMATCH_TOLERANCE_MINUTES = 1
+UNUSUAL_AWAKE_RATIO = 0.30
+NAP_MAX_MINUTES = 360
+LONG_UNRELIABLE_MINUTES = 240
+DAYTIME_START_HOUR = 7
+DAYTIME_END_HOUR = 21
+
+
+def _load_local_timezone():
+    configured_name = os.environ.get(_TZ_ENV_VAR)
+
+    if configured_name is None:
+        return ZoneInfo(_DEFAULT_TZ_NAME)
+
+    try:
+        return ZoneInfo(configured_name)
+    except ZoneInfoNotFoundError as exc:
+        raise RuntimeError(
+            f"{_TZ_ENV_VAR} is set to an invalid timezone "
+            f"'{configured_name}'"
+        ) from exc
+
+
+LOCAL_TZ = _load_local_timezone()
+
+
+def _to_local(utc_iso_string):
+    """Convert an offset-aware timestamp to the configured timezone."""
+    if not utc_iso_string:
+        return None, "timestamp_missing"
+
+    try:
+        timestamp_text = str(utc_iso_string)
+        if timestamp_text.endswith("Z"):
+            timestamp_text = timestamp_text[:-1] + "+00:00"
+        parsed = datetime.fromisoformat(timestamp_text)
+    except (TypeError, ValueError):
+        return None, "timestamp_malformed"
+
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None, "timestamp_timezone_missing"
+
+    try:
+        return parsed.astimezone(LOCAL_TZ), None
+    except (OverflowError, ValueError):
+        return None, "timestamp_conversion_failed"
+
+
+def _to_finite_number_or_none(value):
+    if value is None:
+        return None
+
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+
+    if not math.isfinite(numeric):
+        return None
+
+    return numeric
+
+
+def _to_int_or_none(value):
+    numeric = _to_finite_number_or_none(value)
+
+    if numeric is None or not numeric.is_integer():
+        return None
+
+    return int(numeric)
+
+
+def _safe_stage_awake_minutes(stage_totals):
+    if not isinstance(stage_totals, dict):
+        return None
+
+    awake = stage_totals.get("AWAKE")
+
+    if not isinstance(awake, dict):
+        return None
+
+    return awake.get("minutes")
+
+
+def _classify_measurement_quality(
+    sleep_type,
+    stages_status,
+    minutes_awake_top,
+    stage_totals
+):
+    flags = []
+
+    top_value = _to_int_or_none(minutes_awake_top)
+    stage_raw = _safe_stage_awake_minutes(stage_totals)
+    stage_value = _to_int_or_none(stage_raw)
+
+    if minutes_awake_top is not None and top_value is None:
+        flags.append("minutes_awake_top_invalid")
+
+    if stage_raw is not None and stage_value is None:
+        flags.append("sleep_stage_totals_awake_invalid")
+
+    if top_value is not None and stage_value is not None:
+        if (
+            abs(top_value - stage_value)
+            > AWAKE_MISMATCH_TOLERANCE_MINUTES
+        ):
+            flags.append("awake_minutes_mismatch")
+            return "contradictory", flags
+    elif (top_value is not None) != (stage_value is not None):
+        flags.append("awake_minutes_partial_comparison")
+
+    if stages_status == "REJECTED_COVERAGE":
+        flags.append("measurement_rejected")
+        return "rejected", flags
+
+    if sleep_type == "CLASSIC":
+        flags.append("measurement_classic")
+        return "classic", flags
+
+    if sleep_type == "STAGES" and stages_status == "SUCCEEDED":
+        return "stages", flags
+
+    flags.append("measurement_partial")
+    return "partial", flags
+
+
+def _is_daytime_midpoint(local_start, local_end):
+    if local_start is None or local_end is None:
+        return False
+
+    midpoint = local_start + (local_end - local_start) / 2
+
+    return (
+        DAYTIME_START_HOUR
+        <= midpoint.hour
+        < DAYTIME_END_HOUR
+    )
+
+
+def _classify_sleep_role(
+    main_sleep_flag,
+    duration_minutes,
+    local_start,
+    local_end,
+    measurement_quality
+):
+    if main_sleep_flag is True:
+        return "main_sleep"
+
+    if (
+        measurement_quality in ("rejected", "contradictory")
+        and duration_minutes is not None
+        and duration_minutes >= LONG_UNRELIABLE_MINUTES
+    ):
+        return "unknown"
+
+    if (
+        local_start is None
+        or local_end is None
+        or duration_minutes is None
+        or duration_minutes <= 0
+    ):
+        return "unknown"
+
+    same_local_day = local_start.date() == local_end.date()
+
+    if not same_local_day:
+        return "fragment"
+
+    if (
+        duration_minutes <= NAP_MAX_MINUTES
+        and _is_daytime_midpoint(local_start, local_end)
+    ):
+        return "nap"
+
+    return "fragment"
+
+
+def _sleep_quality(
+    measurement_quality,
+    role,
+    minutes_awake_top,
+    minutes_in_sleep_period,
+    measurement_flags,
+    timestamp_flags
+):
+    flags = list(measurement_flags) + list(timestamp_flags)
+    usable_for = ["display"]
+
+    duration_value = _to_finite_number_or_none(
+        minutes_in_sleep_period
+    )
+
+    if duration_value is None:
+        flags.append("sleep_duration_invalid")
+    elif duration_value <= 0:
+        flags.append("sleep_duration_nonpositive")
+        duration_value = None
+
+    if role == "main_sleep":
+        if duration_value is not None:
+            usable_for.append("recovery_sleep_duration")
+
+        if not timestamp_flags:
+            usable_for.append("recovery_sleep_timing")
+
+        if measurement_quality == "stages" and not measurement_flags:
+            usable_for.extend([
+                "recovery_sleep_continuity",
+                "recovery_sleep_stages"
+            ])
+
+    elif role == "nap":
+        if duration_value is not None:
+            usable_for.append("recovery_nap_duration")
+
+        if not timestamp_flags:
+            usable_for.append("recovery_nap_timing")
+
+    awake_value = _to_finite_number_or_none(minutes_awake_top)
+
+    if (
+        awake_value is not None
+        and duration_value is not None
+        and awake_value >= 0
+        and awake_value / duration_value > UNUSUAL_AWAKE_RATIO
+    ):
+        flags.append("unusual_high_awake_ratio")
+
+    if len(usable_for) == 1:
+        quality_status = "invalid"
+    elif (
+        measurement_quality
+        in ("classic", "contradictory", "rejected", "partial")
+        or flags
+    ):
+        quality_status = "usable_with_caution"
+    else:
+        quality_status = "valid"
+
+    return quality_status, flags, usable_for
+
+
 def parse_sleep(item):
     sleep = item.get("sleep", {})
     interval = sleep.get("interval", {})
@@ -1324,11 +1572,19 @@ def parse_sleep(item):
 
     stage_totals = {}
 
-    for stage in summary.get(
-        "stagesSummary",
-        []
-    ):
+    stages_summary = summary.get("stagesSummary", [])
+
+    if not isinstance(stages_summary, list):
+        stages_summary = []
+
+    for stage in stages_summary:
+        if not isinstance(stage, dict):
+            continue
+
         stage_type = stage.get("type")
+
+        if stage_type is None:
+            continue
 
         stage_totals[stage_type] = {
             "minutes": stage.get("minutes"),
@@ -1337,62 +1593,107 @@ def parse_sleep(item):
 
     stage_timeline = []
 
-    for stage in sleep.get("stages", []):
+    stages = sleep.get("stages", [])
+
+    if not isinstance(stages, list):
+        stages = []
+
+    for stage in stages:
+        if not isinstance(stage, dict):
+            continue
+
         stage_timeline.append({
             "type": stage.get("type"),
             "start": stage.get("startTime"),
             "end": stage.get("endTime")
         })
 
-    return {
-        "start":
-            interval.get("startTime"),
+    start_raw = interval.get("startTime")
+    end_raw = interval.get("endTime")
 
-        "end":
-            interval.get("endTime"),
+    local_start, start_error = _to_local(start_raw)
+    local_end, end_error = _to_local(end_raw)
 
-        "sleep_type":
+    timestamp_flags = []
+
+    if start_error:
+        timestamp_flags.append(f"start_{start_error}")
+
+    if end_error:
+        timestamp_flags.append(f"end_{end_error}")
+
+    measurement_quality, measurement_flags = (
+        _classify_measurement_quality(
             sleep.get("type"),
+            metadata.get("stagesStatus"),
+            summary.get("minutesAwake"),
+            stage_totals
+        )
+    )
 
+    duration_minutes = _to_finite_number_or_none(
+        summary.get("minutesInSleepPeriod")
+    )
+
+    role = _classify_sleep_role(
+        metadata.get("mainSleep"),
+        duration_minutes,
+        local_start,
+        local_end,
+        measurement_quality
+    )
+
+    quality_status, quality_flags, usable_for = _sleep_quality(
+        measurement_quality,
+        role,
+        summary.get("minutesAwake"),
+        summary.get("minutesInSleepPeriod"),
+        measurement_flags,
+        timestamp_flags
+    )
+
+    return {
+        "start": start_raw,
+        "end": end_raw,
+        "sleep_type": sleep.get("type"),
         "minutes_in_sleep_period":
-            summary.get(
-                "minutesInSleepPeriod"
-            ),
-
+            summary.get("minutesInSleepPeriod"),
         "minutes_asleep":
             summary.get("minutesAsleep"),
-
         "minutes_awake":
             summary.get("minutesAwake"),
-
         "minutes_to_fall_asleep":
-            summary.get(
-                "minutesToFallAsleep"
-            ),
-
+            summary.get("minutesToFallAsleep"),
         "minutes_after_wakeup":
-            summary.get(
-                "minutesAfterWakeUp"
-            ),
-
+            summary.get("minutesAfterWakeUp"),
         "stages_status":
             metadata.get("stagesStatus"),
-
         "main_sleep":
             metadata.get("mainSleep"),
-
         "sleep_stage_totals":
             stage_totals,
-
         "sleep_stage_timeline":
             stage_timeline,
-
         "device":
-            source.get("device", {})
-            .get("displayName"),
-
+            source.get("device", {}).get("displayName"),
         "platform":
-            source.get("platform")
+            source.get("platform"),
+        "local_start":
+            local_start.isoformat() if local_start else None,
+        "local_end":
+            local_end.isoformat() if local_end else None,
+        "local_wake_date":
+            local_end.date().isoformat() if local_end else None,
+        "sleep_role":
+            role,
+        "sleep_measurement_quality":
+            measurement_quality,
+        "quality_status":
+            quality_status,
+        "quality_flags":
+            quality_flags,
+        "usable_for":
+            usable_for
     }
 
 
